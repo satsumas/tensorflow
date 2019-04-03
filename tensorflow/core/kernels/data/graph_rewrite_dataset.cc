@@ -13,7 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/kernels/data/graph_rewrite_dataset.h"
+#include <memory>
 
+#include "tensorflow/core/framework/dataset.h"
+#include "tensorflow/core/kernels/data/dataset_utils.h"
 #include "tensorflow/core/protobuf/meta_graph.pb.h"
 #include "tensorflow/core/protobuf/rewriter_config.pb.h"
 
@@ -33,7 +36,6 @@ Status GraphRewriteDataset::Optimize(OpKernelContext* ctx) {
   Node* input_node = nullptr;
   SerializationContext::Params params;
   std::vector<std::pair<string, Tensor>> input_list;
-  params.flib_def = ctx->function_library()->GetFunctionLibraryDefinition();
   params.input_list = &input_list;
   params.optimization_only = true;
   SerializationContext serialization_ctx(params);
@@ -50,29 +52,23 @@ Status GraphRewriteDataset::Optimize(OpKernelContext* ctx) {
 
   // Instantiate the optimized input pipeline by running the optimized graph
   // using the optimized function library.
-  TF_RETURN_IF_ERROR(ctx->function_library()->Clone(&flib_def_, &pflr_, &lib_));
+  TF_RETURN_IF_ERROR(ctx->function_library()->Clone(&lib_def_, &pflr_, &flr_));
 
   // Create a FunctionHandleCache.
-  function_handle_cache_ = absl::make_unique<FunctionHandleCache>(lib_);
+  function_handle_cache_ = absl::make_unique<FunctionHandleCache>(flr_);
 
   // Some functions may have been modified without having their names
   // changed (for example, nested dataset graphs from FlatMap or
-  // Interleave). To avoid name conflicts, we remove these functions from
-  // flib_def_ before adding the optimized function library.
-  for (const FunctionDef& fd : graph_def.library().function()) {
-    if (flib_def_->Find(fd.signature().name()) != nullptr) {
-      TF_RETURN_IF_ERROR(flib_def_->RemoveFunction(fd.signature().name()));
-    }
-  }
-  TF_RETURN_IF_ERROR(flib_def_->AddLibrary(graph_def.library()));
+  // Interleave).
+  TF_RETURN_IF_ERROR(AddToFunctionLibrary(lib_def_.get(), graph_def.library()));
 
   Graph graph(OpRegistry::Global());
   TF_RETURN_IF_ERROR(ImportGraphDef({}, graph_def, &graph, nullptr));
   std::vector<Tensor> outputs;
-  GraphRunner graph_runner(ctx->function_library()->device());
+  GraphRunner graph_runner(flr_->device());
 
   TF_RETURN_IF_ERROR(
-      graph_runner.Run(&graph, lib_, input_list, {output_node}, &outputs));
+      graph_runner.Run(&graph, flr_, input_list, {output_node}, &outputs));
   TF_RETURN_IF_ERROR(
       GetDatasetFromVariantTensor(outputs[0], &optimized_input_));
   optimized_input_->Ref();
@@ -82,8 +78,8 @@ Status GraphRewriteDataset::Optimize(OpKernelContext* ctx) {
 Status GraphRewriteDataset::AsGraphDefInternal(SerializationContext* ctx,
                                                DatasetGraphDefBuilder* b,
                                                Node** output) const {
-  // We only serialize the optimized dataset to avoid re-running
-  // optimizations when the input pipeline is restored from a checkpoint.
+  // We only serialize the optimized dataset to avoid re-running optimizations
+  // when the input pipeline is restored from a checkpoint.
   TF_RETURN_IF_ERROR(b->AddInputDataset(ctx, optimized_input_, output));
   return Status::OK();
 }
@@ -126,9 +122,9 @@ void RemoveFakeSinks(FunctionDef* function_def) {
 Status GraphRewriteDataset::ApplyOptimizations(OpKernelContext* ctx,
                                                GraphDef* graph_def,
                                                string* output_node) {
-  // Add an identity node as the fetch node, otherwise we might get
-  // 'placeholder is both fed and fetched' errors in some cases when using
-  // input list with placeholder dataset nodes.
+  // Add an identity node as the fetch node, otherwise we might get 'placeholder
+  // is both fed and fetched' errors in some cases when using input list with
+  // placeholder dataset nodes.
   NodeDef* node = graph_def->mutable_node()->Add();
   tensorflow::grappler::graph_utils::SetUniqueGraphNodeName("Sink", graph_def,
                                                             node);
@@ -139,8 +135,9 @@ Status GraphRewriteDataset::ApplyOptimizations(OpKernelContext* ctx,
 
   // Add fake sink node to graph and functions to allow rewriting the actual
   // sink nodes.
-  // TODO(b/118820916): When MetaOptimizer adds provisions for function
-  // retvals to be optimizable, we will no longer need this.
+  //
+  // TODO(b/118820916): When MetaOptimizer adds provisions for function retvals
+  // to be optimizable, we will no longer need this.
   for (auto& function_def : *graph_def->mutable_library()->mutable_function()) {
     AddFakeSinks(&function_def);
   }
@@ -161,6 +158,8 @@ Status GraphRewriteDataset::ApplyOptimizations(OpKernelContext* ctx,
   std::unique_ptr<tensorflow::grappler::GrapplerItem> grappler_item =
       tensorflow::grappler::GrapplerItemFromMetaGraphDef(
           "graph", meta_graph_def, item_config);
+  grappler_item->optimization_options().optimize_function_library =
+      ShouldOptimizeFunctions();
   std::unordered_map<string, tensorflow::DeviceProperties> device_map;
   tensorflow::grappler::VirtualCluster cluster(device_map);
 
@@ -172,8 +171,9 @@ Status GraphRewriteDataset::ApplyOptimizations(OpKernelContext* ctx,
       *grappler_item, config, ctx->device(), &cluster, graph_def));
 
   // Remove fake sinks after optimizations are done.
-  // TODO(b/118820916): When MetaOptimizer adds provisions for function
-  // retvals to be optimizable, we will no longer need this.
+  //
+  // TODO(b/118820916): When MetaOptimizer adds provisions for function retvals
+  // to be optimizable, we will no longer need this.
   for (auto& function_def : *graph_def->mutable_library()->mutable_function()) {
     RemoveFakeSinks(&function_def);
   }
@@ -189,7 +189,7 @@ class GraphRewriteDataset::Iterator
 
   Status Initialize(IteratorContext* ctx) override {
     IteratorContext::Params params(ctx);
-    params.lib = dataset()->lib_;
+    params.lib = dataset()->flr_;
     params.function_handle_cache = dataset()->function_handle_cache_.get();
     return dataset()->optimized_input_->MakeIterator(
         IteratorContext(std::move(params)), prefix(), &input_impl_);
@@ -198,7 +198,7 @@ class GraphRewriteDataset::Iterator
   Status GetNextInternal(IteratorContext* ctx, std::vector<Tensor>* out_tensors,
                          bool* end_of_sequence) override {
     IteratorContext::Params params(ctx);
-    params.lib = dataset()->lib_;
+    params.lib = dataset()->flr_;
     params.function_handle_cache = dataset()->function_handle_cache_.get();
     return input_impl_->GetNext(IteratorContext(std::move(params)), out_tensors,
                                 end_of_sequence);

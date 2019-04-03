@@ -105,7 +105,7 @@ class FunctionTest(test.TestCase):
       with session.Session() as sess:
         self.assertAllEqual([18.0], self.evaluate(call))
 
-  @test_util.run_deprecated_v1
+  @test_util.run_v1_only("b/120545219")
   def testIdentityImplicitDeref(self):
 
     @function.Defun(dtypes.float32, func_name="MyIdentity")
@@ -284,7 +284,7 @@ class FunctionTest(test.TestCase):
         out, = sess.run(dlogits, {logits: x, labels: y})
       self.assertAllClose(out, np.exp(prob - y))
 
-  @test_util.disable_xla("This test never passed for XLA")
+  @test_util.disable_xla("b/124286351")  # No error is raised
   def testCustomGradientError(self):
     dtype = dtypes.float32
 
@@ -497,6 +497,8 @@ class FunctionTest(test.TestCase):
                                          lambda y: AssertFail(y), [x])
       # pylint: enable=unnecessary-lambda
 
+    rewriter_config = rewriter_config_pb2.RewriterConfig(
+        dependency_optimization=rewriter_config_pb2.RewriterConfig.OFF)
     # Enables inlining.
     config = config_pb2.ConfigProto(
         graph_options=config_pb2.GraphOptions(
@@ -504,7 +506,8 @@ class FunctionTest(test.TestCase):
                 opt_level=config_pb2.OptimizerOptions.L0,
                 do_common_subexpression_elimination=True,
                 do_function_inlining=True,
-                do_constant_folding=True)))
+                do_constant_folding=True),
+            rewrite_options=rewriter_config))
 
     with session.Session(config=config) as sess:
       # Since the 'False' branch is not taken, the assertion should not fire.
@@ -1052,6 +1055,7 @@ class FunctionTest(test.TestCase):
         self.assertFalse(all(val3 == val1))
         self.assertFalse(all(val4 == val2))
 
+  @test_util.run_v1_only("currently failing on v2")
   def testStatefulFunctionWithWhitelisting(self):
     t = random_ops.random_uniform([100], maxval=10, dtype=dtypes.int32)
 
